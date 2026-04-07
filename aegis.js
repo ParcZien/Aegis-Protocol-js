@@ -1,541 +1,630 @@
-/**
- * AEGIS PROTOCOL v2
- * Universal AI Deterministic Gate — Hardened
- *
- * Zero-dependency vanilla JS. Fail-closed 4-stage validation pipeline
- * with 8 additional hardening fixes for financial-grade determinism.
- *
- * Hardening coverage:
- *   Fix 1: NaN/Infinity rejection via Number.isFinite
- *   Fix 2: Strict type checking, zero coercion
- *   Fix 3: Nested trojan sanitization — dangerous chars rejected in all strings
- *   Fix 4: Nonce-based replay/double-spend protection
- *   Fix 5: Prototype pollution — only manifest-declared keys traversed
- *   Fix 6: Large number precision — Number.isSafeInteger enforcement
- *   Fix 7: Deep freeze on all validated data, clean-room copies throughout
- *   Fix 8: TTL expiry on verification packets
- *
- * Usage:
- *   const result = await Aegis.verify(aiProposal, ruleManifest, systemContext);
- *   if (result.status === 'VERIFIED') {
- *     // Pass result.packet to your API/DB layer
- *     // DB must reject if packet.nonce was already consumed
- *     // DB must reject if Date.now() > packet.expiresAt
- *   }
- *
- * Rule Manifest Schema:
- *   {
- *     requiredKeys: ['action', 'amount'],
- *     ttlMs: 30000,                          // packet lifetime (default 30s)
- *     safeIntegers: true,                     // enforce Number.isSafeInteger on all numbers
- *     dangerousCharsPattern: '[;<>\\\\`"\']', // regex for nested trojan rejection (all strings)
- *     schema: {
- *       action: { type: 'string', whitelist: ['transfer', 'withdraw'], pattern: '^[a-z]+$' },
- *       amount: { type: 'number', min: 0.01, max: 10000 },
- *       memo:   { type: 'string', maxLength: 200 }
- *     },
- *     contextRules: [
- *       { field: 'amount', operator: '<=', contextField: 'balance' },
- *       { field: 'action', operator: 'in', contextField: 'allowedActions' }
- *     ]
- *   }
- */
+'use strict';
 
-const Aegis = (() => {
-  'use strict';
+const { createHash, sign, verify, randomBytes } = require('node:crypto');
+const { z } = require('zod');
 
-  // ═══════════════════════════════════════════════════════════════════
-  // CONFIGURATION DEFAULTS
-  // ═══════════════════════════════════════════════════════════════════
+// ─── Constants ──────────────────────────────────────────────────────
 
-  const DEFAULT_TTL_MS = 30_000;
-  const DEFAULT_DANGEROUS_CHARS = '[;<>`\\\\"\\\'\\x00-\\x1f]';
+const ALLOWED_TYPES = new Set(['string', 'number', 'boolean', 'object']);
+const POISONED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const MAX_DEPTH_DEFAULT = 16;
+const MAX_PAYLOAD_BYTES_DEFAULT = 1_048_576;
 
-  // ═══════════════════════════════════════════════════════════════════
-  // NONCE REGISTRY (Fix 4 — replay protection within this runtime)
-  // ═══════════════════════════════════════════════════════════════════
+// ─── AegisError ─────────────────────────────────────────────────────
 
-  const _consumedNonces = new Set();
-  const MAX_NONCE_CACHE = 10_000;
+class AegisError extends Error {
+  constructor(stage, code, message, details = null) {
+    super(message);
+    this.name = 'AegisError';
+    this.stage = stage;
+    this.code = code;
+    this.details = details;
+  }
+}
 
-  function _generateNonce() {
-    const buf = new Uint8Array(16);
-    crypto.getRandomValues(buf);
-    return Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+// ─── Audit Logger ───────────────────────────────────────────────────
+
+class AuditLogger {
+  constructor(sink) {
+    this._sink = sink || AuditLogger._defaultSink;
   }
 
-  function _consumeNonce(nonce) {
-    if (_consumedNonces.has(nonce)) return false;
-    _consumedNonces.add(nonce);
-    if (_consumedNonces.size > MAX_NONCE_CACHE) {
-      const first = _consumedNonces.values().next().value;
-      _consumedNonces.delete(first);
-    }
-    return true;
+  static _defaultSink(entry) {
+    process.stderr.write(JSON.stringify(entry) + '\n');
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // CRYPTO PRIMITIVES (Web Crypto API — zero external deps)
-  // ═══════════════════════════════════════════════════════════════════
-
-  let _signingKey = null;
-  let _verifyKey = null;
-
-  async function _ensureKeys() {
-    if (_signingKey) return;
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'Ed25519' },
-      false,
-      ['sign', 'verify']
-    ).catch(() =>
-      crypto.subtle.generateKey(
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        false,
-        ['sign', 'verify']
-      )
-    );
-    _signingKey = keyPair.privateKey;
-    _verifyKey = keyPair.publicKey;
+  denial(stage, code, message, meta = {}) {
+    this._emit('DENIAL', stage, code, message, meta);
   }
 
-  async function _sha256(data) {
-    const encoded = new TextEncoder().encode(
-      typeof data === 'string' ? data : JSON.stringify(data)
-    );
-    const buf = await crypto.subtle.digest('SHA-256', encoded);
-    return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+  error(stage, code, message, meta = {}) {
+    this._emit('ERROR', stage, code, message, meta);
   }
 
-  async function _sign(data) {
-    await _ensureKeys();
-    const encoded = new TextEncoder().encode(data);
-    const algo = _signingKey.algorithm.name === 'Ed25519'
-      ? { name: 'Ed25519' }
-      : { name: 'ECDSA', hash: 'SHA-256' };
-    const buf = await crypto.subtle.sign(algo, _signingKey, encoded);
-    return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+  success(keyId, nonce, intentHash, meta = {}) {
+    this._emit('VERIFIED', 'COMPLETE', 'OK', 'Proposal verified', {
+      keyId, nonce, intentHash, ...meta,
+    });
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // CLEAN-ROOM COPY (Fix 5 + Fix 7)
-  // ═══════════════════════════════════════════════════════════════════
-
-  const POISONED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-
-  function _cleanCopy(obj) {
-    const raw = JSON.parse(JSON.stringify(obj));
-    return _stripPoisoned(raw);
-  }
-
-  function _stripPoisoned(node) {
-    if (node === null || typeof node !== 'object') return node;
-    if (Array.isArray(node)) return node.map(_stripPoisoned);
-    const clean = Object.create(null);
-    for (const key of Object.keys(node)) {
-      if (POISONED_KEYS.has(key)) continue;
-      clean[key] = _stripPoisoned(node[key]);
-    }
-    return clean;
-  }
-
-  function _deepFreeze(obj) {
-    if (obj === null || typeof obj !== 'object') return obj;
-    Object.freeze(obj);
-    for (const v of Object.values(obj)) {
-      if (typeof v === 'object' && v !== null && !Object.isFrozen(v)) {
-        _deepFreeze(v);
-      }
-    }
-    return obj;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // DENIAL FACTORY
-  // ═══════════════════════════════════════════════════════════════════
-
-  function _deny(stage, code, message, details = null) {
-    return {
-      status: 'CRITICAL_DENIAL',
+  _emit(level, stage, code, message, meta) {
+    const entry = {
+      ts: new Date().toISOString(),
+      level,
       stage,
       code,
       message,
-      details,
-      timestamp: Date.now()
+      ...meta,
     };
+    try {
+      this._sink(entry);
+    } catch {
+      // Audit sink failure must not break the pipeline
+    }
   }
+}
 
-  // ═══════════════════════════════════════════════════════════════════
-  // STAGE 1: STRUCTURAL INTEGRITY
-  // ═══════════════════════════════════════════════════════════════════
+// ─── Pre-Canonicalization Validation ────────────────────────────────
+// All structural checks run before any serialization or cloning occurs.
 
-  function _stageStructural(proposal, manifest) {
-    let raw;
+function assertNoPoisonedKeys(val, path, depth, maxDepth) {
+  if (depth > maxDepth) {
+    throw new AegisError('STRUCTURAL', 'MAX_DEPTH_EXCEEDED', `Exceeds max depth of ${maxDepth} at ${path}`);
+  }
+  if (val === null || typeof val !== 'object') return;
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) {
+      assertNoPoisonedKeys(val[i], `${path}[${i}]`, depth + 1, maxDepth);
+    }
+    return;
+  }
+  for (const key of Object.keys(val)) {
+    if (POISONED_KEYS.has(key)) {
+      throw new AegisError(
+        'STRUCTURAL', 'PROTOTYPE_POLLUTION',
+        `Poisoned key "${key}" at ${path}`,
+        { key, path }
+      );
+    }
+    assertNoPoisonedKeys(val[key], `${path}.${key}`, depth + 1, maxDepth);
+  }
+}
 
-    if (typeof proposal === 'string') {
-      try {
-        raw = JSON.parse(proposal);
-      } catch {
-        return { ok: false, error: _deny(1, 'INVALID_JSON', 'AI output is not valid JSON') };
+function assertAllowedTypes(val, path, depth, maxDepth) {
+  if (depth > maxDepth) {
+    throw new AegisError('STRUCTURAL', 'MAX_DEPTH_EXCEEDED', `Exceeds max depth at ${path}`);
+  }
+  if (val === null) return;
+  if (val === undefined) {
+    throw new AegisError('TYPE', 'DISALLOWED_TYPE', `undefined not allowed at ${path}`, { path });
+  }
+  const t = typeof val;
+  if (!ALLOWED_TYPES.has(t)) {
+    throw new AegisError('TYPE', 'DISALLOWED_TYPE', `Type "${t}" not allowed at ${path}`, { path, type: t });
+  }
+  if (t === 'number') {
+    if (!Number.isFinite(val)) {
+      throw new AegisError('TYPE', 'NON_FINITE_NUMBER', `Non-finite number at ${path}: ${val}`, { path, value: String(val) });
+    }
+  }
+  if (t === 'object') {
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) {
+        assertAllowedTypes(val[i], `${path}[${i}]`, depth + 1, maxDepth);
       }
-    } else if (typeof proposal === 'object' && proposal !== null && !Array.isArray(proposal)) {
-      raw = proposal;
     } else {
-      return { ok: false, error: _deny(1, 'INVALID_TYPE', 'Proposal must be a JSON string or plain object') };
+      for (const k of Object.keys(val)) {
+        assertAllowedTypes(val[k], `${path}.${k}`, depth + 1, maxDepth);
+      }
     }
+  }
+}
 
-    // Clean-room copy: severs references, strips __proto__ et al.
-    const parsed = _cleanCopy(raw);
+function assertPayloadSize(raw, maxBytes) {
+  const bytes = typeof raw === 'string'
+    ? Buffer.byteLength(raw, 'utf8')
+    : Buffer.byteLength(canonicalize(raw), 'utf8');
+  if (bytes > maxBytes) {
+    throw new AegisError('STRUCTURAL', 'PAYLOAD_TOO_LARGE', `Payload ${bytes} bytes exceeds limit ${maxBytes}`, { bytes, limit: maxBytes });
+  }
+}
 
-    // Detect prototype pollution attempts explicitly (Fix 5)
-    const rawKeys = typeof proposal === 'string'
-      ? Object.keys(JSON.parse(proposal))
-      : Object.keys(proposal);
-    const poisoned = rawKeys.filter(k => POISONED_KEYS.has(k));
-    if (poisoned.length > 0) {
-      return {
-        ok: false,
-        error: _deny(1, 'PROTOTYPE_POLLUTION', `Blocked prototype-polluting keys: ${poisoned.join(', ')}`, { poisoned })
-      };
+// ─── Structural Clone (null-prototype, no JSON round-trip) ──────────
+
+function structuralClone(val, depth, maxDepth) {
+  if (depth > maxDepth) {
+    throw new AegisError('STRUCTURAL', 'MAX_DEPTH_EXCEEDED', 'Clone exceeds max depth');
+  }
+  if (val === null || typeof val !== 'object') return val;
+  if (Array.isArray(val)) {
+    const arr = new Array(val.length);
+    for (let i = 0; i < val.length; i++) {
+      arr[i] = structuralClone(val[i], depth + 1, maxDepth);
     }
+    return arr;
+  }
+  const out = Object.create(null);
+  for (const k of Object.keys(val)) {
+    out[k] = structuralClone(val[k], depth + 1, maxDepth);
+  }
+  return out;
+}
 
-    // Required keys
-    const missing = manifest.requiredKeys.filter(k => !(k in parsed));
-    if (missing.length > 0) {
-      return {
-        ok: false,
-        error: _deny(1, 'MISSING_KEYS', `Missing required keys: ${missing.join(', ')}`, { missing })
-      };
+// ─── Canonical JSON ─────────────────────────────────────────────────
+
+function canonicalize(val) {
+  if (val === null) return 'null';
+  const t = typeof val;
+  if (t === 'boolean') return val ? 'true' : 'false';
+  if (t === 'number') return Object.is(val, -0) ? '0' : String(val);
+  if (t === 'string') return JSON.stringify(val);
+  if (Array.isArray(val)) return '[' + val.map(canonicalize).join(',') + ']';
+  const keys = Object.keys(val).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalize(val[k])).join(',') + '}';
+}
+
+// ─── Deep Freeze ────────────────────────────────────────────────────
+
+function deepFreeze(obj) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  Object.freeze(obj);
+  const vals = Array.isArray(obj) ? obj : Object.values(obj);
+  for (const v of vals) {
+    if (typeof v === 'object' && v !== null && !Object.isFrozen(v)) {
+      deepFreeze(v);
     }
+  }
+  return obj;
+}
 
-    // Hallucinated keys
-    const allowedKeys = new Set(Object.keys(manifest.schema));
-    const extra = Object.keys(parsed).filter(k => !allowedKeys.has(k));
-    if (extra.length > 0) {
-      return {
-        ok: false,
-        error: _deny(1, 'HALLUCINATED_KEYS', `Unexpected keys: ${extra.join(', ')}`, { extra })
-      };
+// ─── Nonce Stores ───────────────────────────────────────────────────
+
+class MemoryNonceStore {
+  constructor() {
+    this._map = new Map();
+  }
+  async has(nonce) {
+    const exp = this._map.get(nonce);
+    if (exp === undefined) return false;
+    if (Date.now() > exp) {
+      this._map.delete(nonce);
+      return false;
     }
+    return true;
+  }
+  async set(nonce, ttlMs) {
+    if (this._map.has(nonce)) {
+      throw new AegisError('NONCE', 'REPLAY_DETECTED', `Nonce ${nonce} already consumed`);
+    }
+    this._map.set(nonce, Date.now() + ttlMs);
+  }
+}
 
-    return { ok: true, parsed };
+class RedisNonceStore {
+  constructor(redisClient) {
+    if (!redisClient) throw new Error('RedisNonceStore requires a redis client');
+    this._redis = redisClient;
+    this._prefix = 'aegis:nonce:';
+  }
+  async has(nonce) {
+    const val = await this._redis.get(this._prefix + nonce);
+    return val !== null;
+  }
+  async set(nonce, ttlMs) {
+    const result = await this._redis.set(this._prefix + nonce, '1', { NX: true, PX: ttlMs });
+    if (result === null) {
+      throw new AegisError('NONCE', 'REPLAY_DETECTED', `Nonce ${nonce} already consumed`);
+    }
+  }
+}
+
+// ─── Key Ring ───────────────────────────────────────────────────────
+
+class KeyRing {
+  constructor() {
+    this._keys = new Map();       // keyId -> { privateKey, publicKey, createdAt }
+    this._activeKeyId = null;
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // STAGE 2: TYPE ENFORCEMENT
-  // ═══════════════════════════════════════════════════════════════════
-
-  function _stageTypeEnforcement(parsed, manifest) {
-    const violations = [];
-
-    for (const [key, rule] of Object.entries(manifest.schema)) {
-      if (!(key in parsed)) continue;
-      const value = parsed[key];
-
-      if (value === null || value === undefined) {
-        if (manifest.requiredKeys.includes(key)) {
-          violations.push({ key, expected: rule.type, got: 'null/undefined' });
-        }
-        continue;
-      }
-
-      // Strict type — "100" !== number (Fix 2)
-      const actual = typeof value;
-      if (actual !== rule.type) {
-        violations.push({ key, expected: rule.type, got: actual, value });
-        continue;
-      }
-
-      if (rule.type === 'number') {
-        // Fix 1: NaN, Infinity, -Infinity
-        if (!Number.isFinite(value)) {
-          violations.push({ key, expected: 'finite number', got: String(value) });
-          continue;
-        }
-        // Fix 6: unsafe integer precision
-        if (manifest.safeIntegers && Number.isInteger(value) && !Number.isSafeInteger(value)) {
-          violations.push({
-            key,
-            expected: `safe integer (abs <= ${Number.MAX_SAFE_INTEGER})`,
-            got: value
-          });
-        }
-      }
+  addKey(keyId, privateKey, publicKey) {
+    if (this._keys.has(keyId)) {
+      throw new Error(`Key ID "${keyId}" already exists`);
     }
-
-    if (violations.length > 0) {
-      return {
-        ok: false,
-        error: _deny(2, 'TYPE_MISMATCH', `Type violations in ${violations.length} field(s)`, { violations })
-      };
+    this._keys.set(keyId, { privateKey, publicKey, createdAt: Date.now() });
+    if (!this._activeKeyId) {
+      this._activeKeyId = keyId;
     }
-
-    return { ok: true };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // STAGE 3: BOUNDARY CONSTRAINTS
-  // ═══════════════════════════════════════════════════════════════════
-
-  function _stageBoundary(parsed, manifest) {
-    const violations = [];
-    const dangerousCharsRegex = new RegExp(
-      manifest.dangerousCharsPattern || DEFAULT_DANGEROUS_CHARS
-    );
-
-    for (const [key, rule] of Object.entries(manifest.schema)) {
-      if (!(key in parsed)) continue;
-      const value = parsed[key];
-      if (value === null || value === undefined) continue;
-
-      // ── Number constraints ──
-      if (rule.type === 'number') {
-        if (rule.min !== undefined && value < rule.min) {
-          violations.push({ key, constraint: 'min', limit: rule.min, actual: value });
-        }
-        if (rule.max !== undefined && value > rule.max) {
-          violations.push({ key, constraint: 'max', limit: rule.max, actual: value });
-        }
-      }
-
-      // ── String constraints ──
-      if (rule.type === 'string') {
-        // Fix 3: nested trojan — dangerous characters
-        if (dangerousCharsRegex.test(value)) {
-          violations.push({
-            key,
-            constraint: 'dangerousChars',
-            pattern: dangerousCharsRegex.source,
-            actual: value,
-            reason: 'String contains potentially dangerous characters'
-          });
-          continue;
-        }
-
-        if (rule.minLength !== undefined && value.length < rule.minLength) {
-          violations.push({ key, constraint: 'minLength', limit: rule.minLength, actual: value.length });
-        }
-        if (rule.maxLength !== undefined && value.length > rule.maxLength) {
-          violations.push({ key, constraint: 'maxLength', limit: rule.maxLength, actual: value.length });
-        }
-        if (rule.pattern && !new RegExp(rule.pattern).test(value)) {
-          violations.push({ key, constraint: 'pattern', pattern: rule.pattern, actual: value });
-        }
-        if (rule.whitelist && !rule.whitelist.includes(value)) {
-          violations.push({ key, constraint: 'whitelist', allowed: rule.whitelist, actual: value });
-        }
-        if (rule.blacklist && rule.blacklist.includes(value)) {
-          violations.push({ key, constraint: 'blacklist', blocked: rule.blacklist, actual: value });
-        }
-      }
+  setActiveKey(keyId) {
+    if (!this._keys.has(keyId)) {
+      throw new Error(`Key ID "${keyId}" not found`);
     }
-
-    if (violations.length > 0) {
-      return {
-        ok: false,
-        error: _deny(3, 'BOUNDARY_VIOLATION', `Boundary violations in ${violations.length} field(s)`, { violations })
-      };
-    }
-
-    return { ok: true };
+    this._activeKeyId = keyId;
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // STAGE 4: CONTEXTUAL VERIFICATION
-  // ═══════════════════════════════════════════════════════════════════
-
-  function _stageContextual(parsed, manifest, context) {
-    if (!manifest.contextRules || manifest.contextRules.length === 0) {
-      return { ok: true };
+  removeKey(keyId) {
+    if (keyId === this._activeKeyId) {
+      throw new Error('Cannot remove the active signing key');
     }
-
-    const violations = [];
-
-    for (const rule of manifest.contextRules) {
-      const proposalValue = parsed[rule.field];
-      const contextValue = context[rule.contextField];
-
-      if (proposalValue === undefined) continue;
-
-      if (contextValue === undefined) {
-        violations.push({
-          rule,
-          reason: `Context field "${rule.contextField}" missing from system context`
-        });
-        continue;
-      }
-
-      let passed = false;
-      switch (rule.operator) {
-        case '<=':  passed = proposalValue <= contextValue; break;
-        case '>=':  passed = proposalValue >= contextValue; break;
-        case '<':   passed = proposalValue < contextValue; break;
-        case '>':   passed = proposalValue > contextValue; break;
-        case '===': passed = proposalValue === contextValue; break;
-        case '!==': passed = proposalValue !== contextValue; break;
-        case 'in':
-          passed = Array.isArray(contextValue) && contextValue.includes(proposalValue);
-          break;
-        case 'not_in':
-          passed = Array.isArray(contextValue) && !contextValue.includes(proposalValue);
-          break;
-        default:
-          violations.push({ rule, reason: `Unknown operator: "${rule.operator}"` });
-          continue;
-      }
-
-      if (!passed) {
-        violations.push({
-          field: rule.field,
-          operator: rule.operator,
-          proposalValue,
-          contextField: rule.contextField,
-          contextValue: Array.isArray(contextValue) ? `[${contextValue.length} items]` : contextValue,
-          reason: `${rule.field} (${proposalValue}) ${rule.operator} ${rule.contextField} (${contextValue}) → false`
-        });
-      }
-    }
-
-    if (violations.length > 0) {
-      return {
-        ok: false,
-        error: _deny(4, 'CONTEXT_VIOLATION', `Contextual violations in ${violations.length} rule(s)`, { violations })
-      };
-    }
-
-    return { ok: true };
+    this._keys.delete(keyId);
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // PUBLIC API
-  // ═══════════════════════════════════════════════════════════════════
+  getSigningKey() {
+    if (!this._activeKeyId) {
+      throw new AegisError('CONFIG', 'NO_ACTIVE_KEY', 'No active signing key configured');
+    }
+    const entry = this._keys.get(this._activeKeyId);
+    return { keyId: this._activeKeyId, privateKey: entry.privateKey };
+  }
 
+  getPublicKey(keyId) {
+    const entry = this._keys.get(keyId);
+    if (!entry) {
+      throw new AegisError('SIGNATURE', 'UNKNOWN_KEY_ID', `Key ID "${keyId}" not found`);
+    }
+    return entry.publicKey;
+  }
+
+  listKeys() {
+    return Array.from(this._keys.entries()).map(([id, entry]) => ({
+      keyId: id,
+      active: id === this._activeKeyId,
+      createdAt: entry.createdAt,
+    }));
+  }
+}
+
+// ─── AegisValidator ─────────────────────────────────────────────────
+
+class AegisValidator {
   /**
-   * Aegis.verify(aiProposal, ruleManifest, systemContext)
-   *
-   * @param {string|object} aiProposal   - Raw AI output (JSON string or object)
-   * @param {object}        ruleManifest  - Immutable rule schema
-   * @param {object}        systemContext - Live environment state
-   * @returns {Promise<object>} VERIFIED packet or CRITICAL_DENIAL
+   * @param {Object} opts
+   * @param {KeyRing} opts.keyRing
+   * @param {Object}  [opts.nonceStore]      - { has(nonce), set(nonce, ttlMs) }
+   * @param {number}  [opts.ttlMs=30000]
+   * @param {boolean} [opts.freeze=false]
+   * @param {number}  [opts.maxPayloadBytes=1048576]
+   * @param {number}  [opts.maxDepth=16]
+   * @param {Function} [opts.auditSink]      - (entry: object) => void
    */
-  async function verify(aiProposal, ruleManifest, systemContext) {
+  constructor(opts) {
+    if (!opts.keyRing || !(opts.keyRing instanceof KeyRing)) {
+      throw new Error('AegisValidator requires a KeyRing instance');
+    }
+    this._keyRing = opts.keyRing;
+    this._nonceStore = opts.nonceStore || new MemoryNonceStore();
+    this._ttlMs = opts.ttlMs ?? 30_000;
+    this._freeze = opts.freeze ?? false;
+    this._maxPayloadBytes = opts.maxPayloadBytes ?? MAX_PAYLOAD_BYTES_DEFAULT;
+    this._maxDepth = opts.maxDepth ?? MAX_DEPTH_DEFAULT;
+    this._audit = new AuditLogger(opts.auditSink || undefined);
+  }
+
+  async verify(rawProposal, manifest, context) {
     const t0 = performance.now();
+    try {
+      // ── 1. Parse raw input ──
+      let proposal;
+      if (typeof rawProposal === 'string') {
+        try {
+          proposal = JSON.parse(rawProposal);
+        } catch {
+          throw new AegisError('STRUCTURAL', 'INVALID_JSON', 'Proposal is not valid JSON');
+        }
+      } else if (typeof rawProposal === 'object' && rawProposal !== null && !Array.isArray(rawProposal)) {
+        proposal = rawProposal;
+      } else {
+        throw new AegisError('STRUCTURAL', 'INVALID_TYPE', 'Proposal must be a JSON string or plain object');
+      }
 
-    // Clean-room, prototype-safe, deep-frozen copies (Fix 5 + Fix 7)
-    const manifest = _deepFreeze(_cleanCopy(ruleManifest));
-    const context = _deepFreeze(_cleanCopy(systemContext));
+      // ── 2. All validation BEFORE any serialization/cloning ──
 
-    // ── Stage 1: Structural Integrity ──
-    const s1 = _stageStructural(aiProposal, manifest);
-    if (!s1.ok) return { ...s1.error, latencyMs: performance.now() - t0 };
+      // 2a. Payload size
+      assertPayloadSize(rawProposal, this._maxPayloadBytes);
 
-    // Deep-freeze parsed proposal immediately (Fix 7)
-    const parsed = _deepFreeze(s1.parsed);
+      // 2b. Recursive prototype pollution scan on raw input
+      assertNoPoisonedKeys(proposal, '$', 0, this._maxDepth);
 
-    // ── Stage 2: Type Enforcement ──
-    const s2 = _stageTypeEnforcement(parsed, manifest);
-    if (!s2.ok) return { ...s2.error, latencyMs: performance.now() - t0 };
+      // 2c. Type restriction scan on raw input
+      assertAllowedTypes(proposal, '$', 0, this._maxDepth);
 
-    // ── Stage 3: Boundary Constraints ──
-    const s3 = _stageBoundary(parsed, manifest);
-    if (!s3.ok) return { ...s3.error, latencyMs: performance.now() - t0 };
+      // ── 3. Clone into null-prototype objects (safe after validation) ──
+      const cloned = structuralClone(proposal, 0, this._maxDepth);
 
-    // ── Stage 4: Contextual Verification ──
-    const s4 = _stageContextual(parsed, manifest, context);
-    if (!s4.ok) return { ...s4.error, latencyMs: performance.now() - t0 };
+      // ── 4. Zod schema validation ──
+      if (!manifest.schema || typeof manifest.schema.safeParse !== 'function') {
+        throw new AegisError('CONFIG', 'INVALID_MANIFEST', 'manifest.schema must be a Zod schema');
+      }
 
-    // ── All stages passed → Verification Packet ──
+      const schemaToUse = manifest.stripUnknown
+        ? manifest.schema
+        : (manifest.schema instanceof z.ZodObject ? manifest.schema.strict() : manifest.schema);
 
-    const nonce = _generateNonce();                            // Fix 4
-    const timestamp = Date.now();
-    const ttlMs = manifest.ttlMs || DEFAULT_TTL_MS;
-    const expiresAt = timestamp + ttlMs;                       // Fix 8
-    const intentHash = await _sha256(parsed);
-    const signaturePayload = `${nonce}:${timestamp}:${expiresAt}:${intentHash}`;
-    const signature = await _sign(signaturePayload);
+      const parsed = schemaToUse.safeParse(cloned);
+      if (!parsed.success) {
+        throw new AegisError('SCHEMA', 'VALIDATION_FAILED', 'Schema validation failed', {
+          issues: parsed.error.issues.map(i => ({
+            path: i.path.join('.'),
+            code: i.code,
+            message: i.message,
+          })),
+        });
+      }
 
-    _consumeNonce(nonce);                                      // Fix 4
+      const validated = parsed.data;
 
-    return {
-      status: 'VERIFIED',
-      sanitizedIntent: parsed,
-      packet: {
+      // ── 5. Post-schema poisoned key re-check (defense in depth) ──
+      assertNoPoisonedKeys(validated, '$', 0, this._maxDepth);
+      assertAllowedTypes(validated, '$', 0, this._maxDepth);
+
+      // ── 6. Context rules ──
+      const ctx = structuralClone(context, 0, this._maxDepth);
+      if (manifest.rules && Array.isArray(manifest.rules)) {
+        for (let i = 0; i < manifest.rules.length; i++) {
+          const rule = manifest.rules[i];
+          if (typeof rule !== 'function') {
+            throw new AegisError('CONFIG', 'INVALID_RULE', `Rule at index ${i} is not a function`, { ruleIndex: i });
+          }
+          try {
+            rule(validated, ctx);
+          } catch (err) {
+            if (err instanceof AegisError) throw err;
+            throw new AegisError('CONTEXT', 'RULE_FAILED', err.message || `Context rule ${i} failed`, { ruleIndex: i });
+          }
+        }
+      }
+
+      // ── 7. Freeze if configured (only the validated payload) ──
+      const intent = this._freeze ? deepFreeze(validated) : validated;
+
+      // ── 8. Canonicalize, hash, sign ──
+      const canonical = canonicalize(intent);
+      const intentHash = createHash('sha256').update(canonical).digest('hex');
+
+      const { keyId, privateKey } = this._keyRing.getSigningKey();
+
+      const nonce = randomBytes(16).toString('hex');
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + this._ttlMs;
+
+      try {
+        await this._nonceStore.set(nonce, this._ttlMs);
+      } catch (err) {
+        if (err instanceof AegisError) throw err;
+        throw new AegisError('NONCE', 'STORE_UNAVAILABLE', `Nonce store failed: ${err.message}`);
+      }
+
+      const signaturePayload = `${keyId}:${nonce}:${issuedAt}:${expiresAt}:${intentHash}`;
+      const signature = sign(null, Buffer.from(signaturePayload), privateKey).toString('hex');
+
+      const packet = {
+        keyId,
         nonce,
-        timestamp,
+        issuedAt,
         expiresAt,
         intentHash,
         signature,
-        algorithm: _signingKey.algorithm.name === 'Ed25519' ? 'Ed25519' : 'ECDSA-P256'
-      },
-      stages: {
-        structural: 'PASS',
-        typeEnforcement: 'PASS',
-        boundary: 'PASS',
-        contextual: 'PASS'
-      },
-      latencyMs: performance.now() - t0
-    };
-  }
+        algorithm: 'Ed25519',
+      };
 
-  /**
-   * Aegis.verifyPacket(packet, sanitizedIntent)
-   *
-   * Re-verify a previously issued packet.
-   * Checks hash integrity, signature validity, and TTL expiry.
-   */
-  async function verifyPacket(packet, sanitizedIntent) {
-    // Fix 8: TTL
-    if (Date.now() > packet.expiresAt) {
-      return { valid: false, reason: 'EXPIRED', expiresAt: packet.expiresAt };
+      this._audit.success(keyId, nonce, intentHash, { latencyMs: performance.now() - t0 });
+
+      return {
+        status: 'VERIFIED',
+        sanitizedIntent: intent,
+        packet,
+        latencyMs: performance.now() - t0,
+      };
+    } catch (err) {
+      const latencyMs = performance.now() - t0;
+      if (err instanceof AegisError) {
+        this._audit.denial(err.stage, err.code, err.message, { details: err.details, latencyMs });
+        return {
+          status: 'CRITICAL_DENIAL',
+          stage: err.stage,
+          code: err.code,
+          message: err.message,
+          details: err.details,
+          timestamp: Date.now(),
+          latencyMs,
+        };
+      }
+      this._audit.error('INTERNAL', 'UNEXPECTED_ERROR', err.message, { latencyMs });
+      return {
+        status: 'CRITICAL_DENIAL',
+        stage: 'INTERNAL',
+        code: 'UNEXPECTED_ERROR',
+        message: err.message || 'Unknown error',
+        details: null,
+        timestamp: Date.now(),
+        latencyMs,
+      };
     }
+  }
 
-    // Hash integrity
-    const recomputedHash = await _sha256(sanitizedIntent);
-    if (recomputedHash !== packet.intentHash) {
-      return { valid: false, reason: 'HASH_MISMATCH' };
+  async verifyPacket(packet, sanitizedIntent) {
+    try {
+      if (!packet || typeof packet !== 'object') {
+        this._audit.denial('PACKET', 'INVALID_PACKET', 'Packet is not an object');
+        return { valid: false, reason: 'INVALID_PACKET' };
+      }
+
+      // TTL
+      if (Date.now() > packet.expiresAt) {
+        this._audit.denial('PACKET', 'EXPIRED', 'Packet TTL expired', {
+          keyId: packet.keyId, nonce: packet.nonce, expiresAt: packet.expiresAt,
+        });
+        return { valid: false, reason: 'EXPIRED' };
+      }
+
+      // Nonce existence
+      let nonceKnown;
+      try {
+        nonceKnown = await this._nonceStore.has(packet.nonce);
+      } catch {
+        this._audit.error('PACKET', 'NONCE_STORE_UNAVAILABLE', 'Could not reach nonce store during verification');
+        return { valid: false, reason: 'NONCE_STORE_UNAVAILABLE' };
+      }
+      if (!nonceKnown) {
+        this._audit.denial('PACKET', 'NONCE_UNKNOWN', 'Nonce not found in store', {
+          keyId: packet.keyId, nonce: packet.nonce,
+        });
+        return { valid: false, reason: 'NONCE_UNKNOWN' };
+      }
+
+      // Hash
+      assertNoPoisonedKeys(sanitizedIntent, '$', 0, this._maxDepth);
+      assertAllowedTypes(sanitizedIntent, '$', 0, this._maxDepth);
+      const canonical = canonicalize(sanitizedIntent);
+      const recomputed = createHash('sha256').update(canonical).digest('hex');
+      if (recomputed !== packet.intentHash) {
+        this._audit.denial('PACKET', 'HASH_MISMATCH', 'Intent hash does not match', {
+          keyId: packet.keyId, nonce: packet.nonce,
+        });
+        return { valid: false, reason: 'HASH_MISMATCH' };
+      }
+
+      // Signature with keyId lookup
+      let publicKey;
+      try {
+        publicKey = this._keyRing.getPublicKey(packet.keyId);
+      } catch {
+        this._audit.denial('PACKET', 'UNKNOWN_KEY_ID', `Key "${packet.keyId}" not in ring`, {
+          keyId: packet.keyId, nonce: packet.nonce,
+        });
+        return { valid: false, reason: 'UNKNOWN_KEY_ID' };
+      }
+
+      const payload = `${packet.keyId}:${packet.nonce}:${packet.issuedAt}:${packet.expiresAt}:${packet.intentHash}`;
+      const sigBuffer = Buffer.from(packet.signature, 'hex');
+      const ok = verify(null, Buffer.from(payload), publicKey, sigBuffer);
+
+      if (!ok) {
+        this._audit.denial('PACKET', 'INVALID_SIGNATURE', 'Signature verification failed', {
+          keyId: packet.keyId, nonce: packet.nonce,
+        });
+        return { valid: false, reason: 'INVALID_SIGNATURE' };
+      }
+
+      return { valid: true };
+    } catch (err) {
+      this._audit.error('PACKET', 'VERIFICATION_ERROR', err.message);
+      return { valid: false, reason: 'VERIFICATION_ERROR' };
     }
-
-    // Signature
-    const payload = `${packet.nonce}:${packet.timestamp}:${packet.expiresAt}:${packet.intentHash}`;
-    const encoded = new TextEncoder().encode(payload);
-    const sigBytes = new Uint8Array(
-      packet.signature.match(/.{2}/g).map(h => parseInt(h, 16))
-    );
-    const algo = packet.algorithm === 'Ed25519'
-      ? { name: 'Ed25519' }
-      : { name: 'ECDSA', hash: 'SHA-256' };
-
-    const sigValid = await crypto.subtle.verify(algo, _verifyKey, sigBytes, encoded);
-    return sigValid
-      ? { valid: true }
-      : { valid: false, reason: 'INVALID_SIGNATURE' };
   }
-
-  /**
-   * Aegis.rotateKeys()
-   * Force new signing keypair. Invalidates all previously signed packets.
-   */
-  async function rotateKeys() {
-    _signingKey = null;
-    _verifyKey = null;
-    await _ensureKeys();
-  }
-
-  /**
-   * Aegis.flushNonces()
-   * Clear the in-memory nonce registry.
-   */
-  function flushNonces() {
-    _consumedNonces.clear();
-  }
-
-  return Object.freeze({ verify, verifyPacket, rotateKeys, flushNonces });
-})();
-
-// ═══════════════════════════════════════════════════════════════════════
-// EXPORT (Node.js / Deno / Bun / Browser)
-// ═══════════════════════════════════════════════════════════════════════
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = Aegis;
-} else if (typeof globalThis !== 'undefined') {
-  globalThis.Aegis = Aegis;
 }
+
+// ─── Exports ────────────────────────────────────────────────────────
+
+module.exports = {
+  AegisValidator,
+  AegisError,
+  AuditLogger,
+  KeyRing,
+  MemoryNonceStore,
+  RedisNonceStore,
+  canonicalize,
+};
+
+// ─── Example Usage ──────────────────────────────────────────────────
+
+/*
+const { generateKeyPairSync } = require('node:crypto');
+const { z } = require('zod');
+
+// --- Key rotation setup ---
+
+const keyRing = new KeyRing();
+
+// Initial key
+const k1 = generateKeyPairSync('ed25519');
+keyRing.addKey('key-2025-01', k1.privateKey, k1.publicKey);
+
+// Rotate: generate a new key, add it, switch active
+const k2 = generateKeyPairSync('ed25519');
+keyRing.addKey('key-2025-07', k2.privateKey, k2.publicKey);
+keyRing.setActiveKey('key-2025-07');
+
+// Old key stays in ring for verifying old packets
+// keyRing.removeKey('key-2025-01');  // only after all old packets have expired
+
+// --- Audit sink ---
+
+const auditLog = [];
+function auditSink(entry) {
+  auditLog.push(entry);
+  // In production: send to structured logging (ELK, Datadog, etc.)
+}
+
+// --- Validator ---
+
+const aegis = new AegisValidator({
+  keyRing,
+  ttlMs: 30_000,
+  freeze: true,
+  maxDepth: 10,
+  auditSink,
+  // nonceStore: new RedisNonceStore(redisClient),
+});
+
+const manifest = {
+  schema: z.object({
+    action: z.enum(['transfer', 'withdraw']),
+    target: z.string().regex(/^[a-zA-Z0-9@.]+$/).max(100),
+    amount: z.number().positive().max(10000),
+  }),
+  rules: [
+    (data, ctx) => {
+      if (data.amount > ctx.balance) {
+        throw new Error(`Insufficient balance: ${data.amount} > ${ctx.balance}`);
+      }
+    },
+    (data, ctx) => {
+      if (!ctx.allowedActions.includes(data.action)) {
+        throw new Error(`Action "${data.action}" not permitted`);
+      }
+    },
+  ],
+};
+
+const context = {
+  balance: 1000,
+  allowedActions: ['transfer', 'withdraw'],
+};
+
+(async () => {
+  // Valid proposal
+  const result = await aegis.verify(
+    { action: 'transfer', target: 'alice@bank.com', amount: 250 },
+    manifest,
+    context,
+  );
+  console.log('Result:', result.status);
+
+  if (result.status === 'VERIFIED') {
+    // Packet contains keyId — verifyPacket looks up the right public key
+    const check = await aegis.verifyPacket(result.packet, result.sanitizedIntent);
+    console.log('Packet valid:', check.valid);
+  }
+
+  // Prototype pollution attempt
+  const attack = await aegis.verify(
+    '{"action":"transfer","target":"x","amount":1,"__proto__":{"admin":true}}',
+    manifest,
+    context,
+  );
+  console.log('Attack result:', attack.status, attack.code);
+
+  // Overdraft attempt
+  const overdraft = await aegis.verify(
+    { action: 'withdraw', target: 'me@bank.com', amount: 5000 },
+    manifest,
+    context,
+  );
+  console.log('Overdraft result:', overdraft.status, overdraft.code);
+
+  console.log('Audit log entries:', auditLog.length);
+  auditLog.forEach(e => console.log(`  [${e.level}] ${e.stage}/${e.code}: ${e.message}`));
+})();
+*/
