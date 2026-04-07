@@ -1,166 +1,198 @@
-[README.md](https://github.com/user-attachments/files/26528331/README.md)
 # Aegis Protocol
+
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Status: Production-Ready](https://img.shields.io/badge/Status-Production--Ready-green.svg)
 ![Dependencies: 0](https://img.shields.io/badge/Dependencies-0-blue.svg)
 
-A deterministic validation gate between AI outputs and real-world execution. Vanilla JavaScript, zero dependencies.
+A deterministic validation gate between AI output and execution.
 
-The idea is simple: the AI proposes, the code disposes. Aegis sits between whatever your model spits out and whatever your system actually does with it. Nothing touches your database or API unless it passes a four-stage, fail-closed validation pipeline and gets a signed cryptographic packet.
+If an AI system in your stack can trigger real actions—payments, API calls, database writes—then you have a boundary problem. Language models are non-deterministic. Your systems are not.
 
-## Why
+Aegis enforces that boundary. Nothing executes unless it passes strict validation and is sealed into a verifiable, time-bound packet.
 
-Language models are non-deterministic. Your database is not. If you're letting an AI decide things like "transfer $500 to account X," you need a hard boundary between what the model *suggests* and what your code *permits*. Aegis is that boundary.
+The AI proposes. The code decides.
 
-It's not a framework. It's one function: `Aegis.verify()`.
+---
 
-## Install
+## What it does
 
-Copy `aegis.js` into your project. That's it. No npm, no bundler, no build step. It uses the Web Crypto API, which is built into every modern browser, Node 20+, Deno, and Bun.
+Aegis takes a proposed action (typically from an AI), validates it against explicit rules and live system state, and returns either:
 
-## Quick Start
+* a VERIFIED result with a signed execution packet
+* or a CRITICAL_DENIAL with a precise failure reason
 
-```js
-const result = await Aegis.verify(
-  // 1. The AI's proposed action (JSON string or object)
-  { action: 'transfer', target: 'alice@bank.com', amount: 250 },
+There is no partial success. The system fails closed.
 
-  // 2. Your rules (immutable for the duration of the call)
-  {
-    requiredKeys: ['action', 'target', 'amount'],
-    ttlMs: 30000,
-    safeIntegers: true,
-    schema: {
-      action: { type: 'string', whitelist: ['transfer', 'withdraw'] },
-      target: { type: 'string', pattern: '^[a-zA-Z0-9@.]+$', maxLength: 100 },
-      amount: { type: 'number', min: 0.01, max: 10000 }
-    },
-    contextRules: [
-      { field: 'amount', operator: '<=', contextField: 'balance' },
-      { field: 'action', operator: 'in', contextField: 'allowedActions' }
-    ]
-  },
+---
 
-  // 3. Live system state
-  { balance: 1000, allowedActions: ['transfer', 'withdraw'] }
-);
+## What problem this solves
 
-if (result.status === 'VERIFIED') {
-  // result.sanitizedIntent — the cleaned, frozen proposal
-  // result.packet — { nonce, timestamp, expiresAt, intentHash, signature, algorithm }
-  executeTransaction(result.sanitizedIntent, result.packet);
-} else {
-  // result.status === 'CRITICAL_DENIAL'
-  // result.stage, result.code, result.message, result.details
-  log(result);
-}
-```
+Without a hard validation layer, AI systems can:
 
-## Validation Pipeline
+* issue valid but incorrect API calls
+* exceed business limits (for example, large refunds or transfers)
+* include unexpected or injected fields
+* replay previously valid but costly actions
+* produce structurally correct but unsafe data
 
-Every call to `verify()` runs four stages in order. Failure at any stage terminates immediately.
+These failures come from using probabilistic outputs to control deterministic systems.
 
-**Stage 1 — Structural Integrity.** Is it valid JSON? Are all required keys present? Are there any keys the manifest doesn't define? If the AI hallucinated extra fields, denied.
+Aegis prevents them by making execution conditional on deterministic checks.
 
-**Stage 2 — Type Enforcement.** Strict `typeof` checks. `"100"` is not a number. `1` is not a boolean. `NaN` and `Infinity` are rejected via `Number.isFinite`. Integers outside the safe range (`±2^53 - 1`) are rejected when `safeIntegers` is enabled.
+---
 
-**Stage 3 — Boundary Constraints.** Numeric `min`/`max`. String `minLength`/`maxLength`, `pattern` (regex), `whitelist`, `blacklist`. A global dangerous-characters check rejects strings containing `;`, `<`, `>`, backticks, quotes, and control characters before any field-level checks run.
+## Design principles
 
-**Stage 4 — Contextual Verification.** Cross-references the proposal against your live system context. Operators: `<=`, `>=`, `<`, `>`, `===`, `!==`, `in`, `not_in`. If the AI requests $500 and the user has $300, denied.
+* Fail closed — any violation terminates immediately
+* Deterministic — no heuristics, no inference
+* Explicit policy — all allowed behavior is declared up front
+* Immutable inputs — all data is copied and frozen before validation
+* Verifiable output — successful results are cryptographically sealed
 
-## The Verification Packet
+---
 
-When all four stages pass, Aegis produces a signed packet:
+## Installation
 
-```js
-{
-  nonce: '7a3f...',           // 128-bit random, one-time use
-  timestamp: 1719400000000,
-  expiresAt: 1719400030000,   // timestamp + ttlMs
-  intentHash: 'sha256...',    // SHA-256 of the sanitized proposal
-  signature: 'ed25519...',    // Signs "nonce:timestamp:expiresAt:hash"
-  algorithm: 'Ed25519'        // or 'ECDSA-P256' as fallback
-}
-```
+Option 1:
 
-Your downstream system should verify two things before execution: (1) the packet hasn't expired, and (2) the nonce hasn't been consumed before. Aegis tracks nonces in-memory for the current runtime, but your database needs its own persistent nonce ledger for cross-process protection.
+npm install aegis-protocol
 
-You can re-verify a packet at any time:
+Option 2:
 
-```js
-const check = await Aegis.verifyPacket(result.packet, result.sanitizedIntent);
-// { valid: true } or { valid: false, reason: 'EXPIRED' | 'HASH_MISMATCH' | 'INVALID_SIGNATURE' }
-```
+Copy aegis.js into your project. No dependencies, no build step.
 
-## Manifest Reference
+Requires a runtime with the Web Crypto API (Node 20+, modern browsers, Deno, Bun).
 
-```js
-{
-  requiredKeys: ['field1', 'field2'],      // must be present in every proposal
-  ttlMs: 30000,                            // packet lifetime in ms (default: 30s)
-  safeIntegers: true,                      // reject integers outside ±2^53-1
-  dangerousCharsPattern: '[;<>`\\\\"\\\'\\x00-\\x1f]',  // override the default trojan-char regex
+---
 
-  schema: {
-    field1: {
-      type: 'string',                      // 'string' | 'number' | 'boolean'
-      pattern: '^[a-z]+$',                 // regex the value must match
-      whitelist: ['a', 'b'],               // exhaustive list of allowed values
-      blacklist: ['x'],                    // values that are never allowed
-      minLength: 1,
-      maxLength: 50
-    },
-    field2: {
-      type: 'number',
-      min: 0,
-      max: 9999
-    }
-  },
+## Quick start
 
-  contextRules: [
-    {
-      field: 'field2',                     // key in the proposal
-      operator: '<=',                      // comparison operator
-      contextField: 'systemLimit'          // key in the system context
-    }
-  ]
-}
-```
+To get started quickly, refer to the "quickstart" file in the repository.
 
-## Hardening
+---
 
-The engine addresses eight specific attack vectors:
+## Where Aegis sits
 
-1. **NaN bypass** — `Number.isFinite` rejects NaN, Infinity, -Infinity at Stage 2.
-2. **Type confusion** — Strict `typeof`, no coercion. `"100"` fails a `number` check.
-3. **Nested trojan injection** — Global dangerous-character regex on all string fields at Stage 3.
-4. **Double-spend / replay** — Cryptographic nonce per packet, in-memory consumption tracking.
-5. **Prototype pollution** — `__proto__`, `constructor`, `prototype` keys are stripped and flagged. All internal objects use `Object.create(null)`.
-6. **Large number precision** — `Number.isSafeInteger` enforcement when `safeIntegers` is enabled.
-7. **Internal mutation** — All inputs are deep-copied and recursively `Object.freeze`'d before validation begins.
-8. **TOCTOU (time-of-check/time-of-use)** — Packets expire after `ttlMs` (default 30 seconds).
+Aegis is a gate between untrusted output and execution.
+
+Typical flow:
+
+1. An AI (or other untrusted system) proposes an action
+2. Aegis validates it against rules and context
+3. Only verified actions are executed
+
+Everything before Aegis is untrusted. Everything after it is constrained.
+
+---
+
+## Validation pipeline
+
+Each call to verify() runs four stages in order. Failure at any stage stops execution.
+
+Stage 1 — Structural integrity
+
+* Valid JSON or object
+* All required keys present
+* No undefined or extra fields
+
+Stage 2 — Type enforcement
+
+* Strict typeof checks
+* No coercion ("100" is not 100)
+* NaN, Infinity, and non-finite values rejected
+* Optional safe integer enforcement
+
+Stage 3 — Boundary constraints
+
+* Numeric limits (min, max)
+* String constraints (pattern, length, whitelist/blacklist)
+* Global dangerous-character filtering
+
+Stage 4 — Contextual verification
+
+* Cross-checks against live system state
+* Examples: amount ≤ balance, action allowed for user
+
+---
+
+## Verification packet
+
+On success, Aegis returns a signed packet containing:
+
+* nonce (one-time use value)
+* timestamp and expiration
+* hash of the validated intent
+* cryptographic signature
+
+This binds the approved action to a specific moment and prevents reuse.
+
+---
+
+## Execution requirements
+
+Before executing any verified action, your system must check:
+
+1. The packet has not expired
+2. The nonce has not been used before
+
+Aegis tracks nonces in-memory, but production systems should maintain a persistent nonce ledger.
+
+---
+
+## Packet verification
+
+You can re-verify a packet at any time to confirm:
+
+* it has not expired
+* it has not been tampered with
+* it matches the intended action
+
+---
+
+## Security model
+
+Aegis addresses:
+
+* Type confusion and coercion
+* Prototype pollution (**proto**, constructor, prototype)
+* Numeric edge cases (NaN, Infinity, unsafe integers)
+* Injection via string payloads
+* Replay attacks (nonce + expiration)
+* Mutation during validation (deep copy + freeze)
+* Time-of-check vs time-of-use gaps
+
+The system does not infer intent. It strictly constrains it.
+
+---
 
 ## API
 
-| Method | Description |
-|---|---|
-| `Aegis.verify(proposal, manifest, context)` | Run the full pipeline. Returns `VERIFIED` or `CRITICAL_DENIAL`. |
-| `Aegis.verifyPacket(packet, intent)` | Re-verify a previously issued packet (hash + signature + TTL). |
-| `Aegis.rotateKeys()` | Generate a new signing keypair. Invalidates all prior packets. |
-| `Aegis.flushNonces()` | Clear the in-memory nonce registry. |
+* Aegis.verify(proposal, manifest, context)
+  Runs the full validation pipeline
 
-All methods return promises. The entire `Aegis` object is frozen.
+* Aegis.verifyPacket(packet, intent)
+  Verifies packet integrity and validity
 
-## Runtime Requirements
+* Aegis.rotateKeys()
+  Generates a new signing keypair
 
-Any environment with the Web Crypto API:
+* Aegis.flushNonces()
+  Clears the in-memory nonce registry
 
-- Browsers (all modern)
-- Node.js 20+
-- Deno
-- Bun
+All methods are asynchronous. The Aegis object is immutable.
 
-Ed25519 is preferred for signing. Falls back to ECDSA P-256 if the runtime doesn't support Ed25519 yet.
+---
+
+## Runtime
+
+* Node.js 20+
+* Modern browsers
+* Deno
+* Bun
+
+Uses the Web Crypto API. Prefers Ed25519, falls back to ECDSA P-256.
+
+---
 
 ## License
 
